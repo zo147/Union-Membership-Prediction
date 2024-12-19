@@ -1,6 +1,3 @@
-# Team-19
- Team 19's group project GitHub repository for MGT 6203 (Canvas) Spring of 2024 semester.
-
 # Instructions for Use:
 
 - Dataset is stored in the 'Data' folder (censusdata.csv).
