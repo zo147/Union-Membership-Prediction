@@ -1,0 +1,464 @@
+---
+title: "initial_model"
+output: html_document
+date: "2024-03-14"
+---
+
+## Load Libraries
+```{r}
+library(caret)
+library(corrplot)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(stringr)
+library(glmnet)
+library(tidyverse)
+library(MASS)
+library(pROC)
+library(Information)
+library(performanceEstimation)
+```
+
+
+#Exploratory Data Analysis
+
+## Read in data
+```{r}
+# Read data
+census_data <- read.csv("../Data/census_data.csv", header=TRUE, na.strings=c(c("", ' ?'),"NA"))
+
+# Drop ID column
+df <- subset(census_data, select = -c(1))
+```
+
+## Percent missing by column
+```{r, echo=FALSE}
+# Percent missing ----------------------------------------------
+pct_missing <- function(data) {
+  # Calculate the total number of observations
+  total_obs <- nrow(data)
+  
+  # Calculate the number of missing values in each column
+  missing_count <- colSums(is.na(data))
+  
+  # Calculate the percentage of missing values in each column
+  percent_missing <- (missing_count / total_obs) *100
+  
+  # Create a data frame to store the results
+  missing_data <- data.frame(Column = names(data), Percent_Missing = percent_missing)
+  
+  # Return the data frame
+  return(missing_data)
+}
+
+percent_missing <- pct_missing(df)
+print(percent_missing)
+```
+
+## Columns to drop
+```{r, echo=FALSE}
+# Drop columns with missing values over 90% of the time
+over_90 <- percent_missing$Percent_Missing > 90
+drop_missing <- percent_missing[over_90, ]
+
+# Columns to drop
+drop_missing$Column
+
+# Variance ---------------------------------------------------- 
+near_zero_variance <- function(data) {
+
+    near_zero_vars <- nearZeroVar(data, names = TRUE, saveMetrics = TRUE)
+    
+    # Create a data frame to store the results
+    variance_data <- data.frame(Column = names(data), ZeroVariance = near_zero_vars$zeroVar, NearZeroVariance = near_zero_vars$nzv)
+    
+    return(variance_data)
+}
+
+near_zero_vars <- near_zero_variance(df)
+
+# Drop columns with zero variance
+zero_var <- near_zero_vars$ZeroVariance == TRUE
+drop_variance <- near_zero_vars[zero_var, ]
+
+# Columns to drop
+drop_variance$Column
+
+
+```
+
+```{r}
+correlation_matrix <- function(data) {
+  # Subset numeric columns
+  numeric_data <- data[, sapply(data, is.numeric)]
+  selected_df <- numeric_data[, c("age", "employment_stat", "wage_per_hour", "working_week_per_year", "industry_code", "occupation_code", "total_employed")]
+  
+  # Calculate correlation matrix
+  corr_matrix <- cor(selected_df)
+  
+  # Create correlation plot
+  corrplot(corr_matrix, method = "color", tl.col= "black", addCoef.col = "black",col=colorRampPalette(c("brown4", "red3", "pink", "red2", "brown4"))(7) , is.corr = FALSE, tl.cex = 1.2,  number.cex = 1.1)
+}
+
+correlation_matrix(df)
+
+# Drop columns from above analysis
+df <- subset(df, select = -c(education_institute, unemployment_reason, 
+                                       under_18_family, migration_prev_sunbelt,
+                                       veterans_admin_questionnaire, 
+                                       old_residence_reg, old_residence_state))
+
+```
+
+
+
+#Variable Selection
+
+## Clean up census_data based on EDA
+```{r}
+set.seed(1234)
+
+#Drop columns discovered in EDA.R
+drop <- match(c("ID", "education_institute", "under_18_family", "veterans_admin_questionnaire", 
+        "old_residence_reg", "old_residence_state", "unemployment_reason", "migration_prev_sunbelt"), names(census_data))
+df <- subset(census_data, select = -drop)
+
+#Remove whitespace from column data
+df <- df %>%
+  mutate(across(where(is.character), str_trim))
+
+#convert non-numeric columns to factors
+cols = c("age", "employment_stat", "wage_per_hour", "working_week_per_year", "industry_code", 
+         "occupation_code", "total_employed", "gains", "losses", "stocks_status", "mig_year", "importance_of_record")
+df[,!names(df) %in% cols] <- lapply(df[,!names(df) %in% cols], as.factor)
+
+#Drop Columns with Na proportion >20%
+df <- df %>%
+  select_if(~mean(is.na(.)) < .2)
+
+#Impute missing values w/ simple Mode imputation for factor items
+mode <- function(x) {
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+df <- df %>%
+  mutate_if(is.factor, list(~replace(., is.na(.), mode(na.omit(.)))))
+
+#Proportions of NA data after cleanup
+df %>%
+  mutate(across(everything(), is.na)) %>%
+  arrange(across(everything())) %>%
+  mutate(row = row_number()) %>%
+  pivot_longer(!row, names_to="column", values_to="missing") %>%
+  ggplot() +
+  geom_tile(aes(row, column, fill=missing)) + ggtitle("Missing Observation Occurances") + xlab("Observation") + ylab("Variable")
+```
+## Explore outliers + Data Cleaning
+ 
+```{r}
+# Replace 'education' (16 levels) with 'education_grp': low_ed, mid_ed, high_ed
+df <- df %>%
+  mutate(education_grp = case_when(
+    education %in% c("Less than 1st grade", "1st 2nd 3rd or 4th grade", "5th or 6th grade", "7th and 8th grade")
+    ~ "low_ed",
+    education %in% c("9th grade", "10th grade", "11th grade", "High school graduate",  " 12th grade no diploma" ) 
+    ~ "mid_ed",
+    TRUE ~ "high_ed"))
+df$education_grp <- factor(df$education_grp, levels = c("high_ed", "mid_ed", "low_ed"))
+
+# Replace 'class' (4 levels) with 'govt_employee': yes or no
+df <- df %>%
+  mutate(govt_employee = 
+           ifelse(class %in% c("Federal government", "Local government", "State government"), 
+                  "yes", "no"))
+df$govt_employee <- factor(df$govt_employee, levels = c("yes", "no"))
+
+# Replace 'marital_status' (7 levels) with 'is_married': yes or no
+# Include "married- spouse absent' with 'is_married: no'. 
+df <- df %>%
+  mutate(is_married = 
+           ifelse(marital_status %in% c("Married-civilian spouse present", "Married-A F spouse present,
+                                        "), "yes", "no"))
+df$is_married <- factor(df$is_married, levels = c("yes", "no"))
+
+# Replace 'is_hispanic' (10 levels) with 'is_hispanic_grp': yes, no, or unknown
+df <- df %>%
+  mutate(is_hispanic_grp = case_when(
+    is_hispanic %in% c("Mexican-American", "Mexican (Mexicano)", "Chicano", 
+                       "Central or South American", "Puerto Rican", "Other Spanish", "Cuban") ~ "yes",
+    is_hispanic %in% c("All other") ~ "no",
+    is_hispanic %in% c("NA", "Do not know") ~ "unknown"))
+df$is_hispanic_grp <- factor(df$is_hispanic_grp, levels = c("yes", "no", "unknown"))
+
+# Replace 'employment_commitment' (7 levels) with 'work_hours': full-time, part-time, or unemployed
+df <- df %>%
+  mutate(work_hours =
+           ifelse(employment_commitment %in% c("Full-time schedules", 
+                                               "Children or Armed Forces"),
+           "full-time",
+           ifelse(employment_commitment %in% c("PT for non-econ reasons usually FT", 
+                                               "PT for econ reasons usually FT", 
+                                               "Unemployed full-time"),
+           "part-time", "unemployed")))
+df$work_hours <- factor(df$work_hours, levels = c("full-time", "part-time", "unemployed"))
+
+# Replace 'tax_status' (6 levels) with 'tax_status_grp': single, joint, head-of-household, nonfiler, or unknown
+df <- df %>%
+  mutate(tax_status_grp = 
+           ifelse(tax_status %in% c("Joint both under 65", 
+                                    "Joint one under 65 & one 65+", 
+                                    "Joint both 65+"),
+                  "joint",
+                  ifelse(tax_status == "Single",
+                         "single",
+                         ifelse(tax_status == "Head of household",
+                                "head-of-household",
+                                ifelse(tax_status == "Nonfiler",
+                                       "nonfiler", "unknown")))))
+df$tax_status_grp <- factor(df$tax_status_grp, levels = 
+                              c("single", "joint", "head-of-household", "nonfiler", "unknown"))
+         
+# Replace 'citizenship' (5 levels) with 'citizenship_grp': citizen, non-citizen, or naturalized citizen
+df <- df %>%
+  mutate(citizenship_grp = case_when(
+    citizenship %in% c("Native", "Native- Born in Puerto Rico or U S Outlying", 
+                       "Native- Born abroad of American Parent(s)") ~ "citizen",
+    citizenship %in% "Foreign born- Not a citizen of U S " ~ "non-citizen",
+    citizenship %in% "Foreign born- U S citizen by naturalization" ~ "naturalized citizen")) 
+df$citizenship_grp <- factor(df$citizenship_grp, levels = 
+                              c("citizen", "non-citizen", "naturalized citizen"))
+
+# For 'is_labor_union, replace "Same" with "Yes"
+#df <- df %>%
+#  mutate(is_labor_union = factor(
+#    ifelse(is_labor_union == "Same", "Yes", is_labor_union),
+#    levels = c("yes", "no") ))
+```
+
+```{r}
+hist(df$age, xlab = "Age", main = "Age Frequency") # skewed slightly right, might want to group into bands for higher age groups.
+summary(df$age) 
+table(df$age)
+
+df$age_grp <- as.factor(ifelse(df$age <25, "<25", ifelse(df$age <30, "25-29", 
+      ifelse(df$age <40, "30-39", ifelse(df$age <50, "40-49", ifelse(df$age <60, "50-59", "60+"))))))
+table(df$age_grp) # lowest group frequency is 1126 for 60+. Use age_grp variable
+
+hist(df$employment_stat, xlab = "Employment Stat", main = "Employment Stat Frequency")
+table(df$employment_stat) # this is a categorical factor
+df$employment_stat <- as.factor(df$employment_stat)
+
+hist(df$wage_per_hour, xlab = "Wage per Hour", main = "Wage per Hour Frequency") # examine for outliers
+summary(df$wage_per_hour) # Minimum 0 and Maximum 9999, manipulate?
+length(which(df$wage_per_hour > 2000)) # consider dropping or grouping due to large number of outliers (~537)
+df$wage_grps <- as.factor(ifelse(df$wage_per_hour == 0, "0", ifelse(df$wage_per_hour < 1000, "1-999", 
+      ifelse(df$wage_per_hour < 2000, "1000-1999","2000+"))))
+table(df$wage_grps) # lowest group frequency is 643 for 2000+. Use wage_grps variable.
+
+hist(df$working_week_per_year, xlab = "Working Week per Year", main = "Working Week per Year Frequency")
+summary(df$working_week_per_year)
+table(df$working_week_per_year) # decent amount of observations in most weeks
+df$working_weeks_grp <- as.factor(ifelse(df$working_week_per_year < 27, "0-26", ifelse(df$working_week_per_year <52, "27-51", "52")))
+table(df$working_weeks_grp) # lowest group frequency is 687 for less than half the year. Use working_weeks_grp variable.
+
+hist(df$industry_code, xlab = "Industry Code", main = "Industry Code Frequency")
+summary(df$industry_code)
+table(df$industry_code) # lowest number of observations in a group is 9 (code 20), rest are 25+
+df$industry_code <- as.factor(df$industry_code) 
+
+hist(df$occupation_code, xlab = "Occupation Code", main = "Occupation Code Frequency") # look at highest value
+summary(df$occupation_code)
+table(df$occupation_code) # lowest number of observations in a group is 7 (code 20), rest are 19+
+df$occupation_code <- as.factor(df$occupation_code)
+
+hist(df$total_employed, xlab = "Total Employed", main = "Total Employed Frequency") # some are 0?
+summary(df$total_employed)
+table(df$total_employed) # group of 0 has 384 observations
+
+hist(df$gains, xlab = "Gains", main = "Gains Frequency") # examine for outliers
+summary(df$gains)
+table(df$gains) # recommend dropping. Due to large amount of 0.
+
+hist(df$losses, xlab = "Losses", main = "Losses Frequency") # examine for outliers
+summary(df$losses)
+table(df$losses) # recommend dropping. Due to large amount of 0. 
+
+hist(df$stocks_status, xlab = "Stock Status", main = "Stock Status Frequency") # examine for outliers
+summary(df$stocks_status)
+#table(df$stocks_status) # recommend dropping or grouping into bins
+df$stock_status_grp <- as.factor(ifelse(df$stocks_status == 0, "0", ifelse(df$stocks_status < 1000, "1-999", "1000+")))
+table(df$stock_status_grp) # not sure how useful this is.
+
+hist(df$mig_year, xlab = "Mig Year", main = "Mig Year Frequency") # examine for outliers
+summary(df$mig_year)
+table(df$mig_year) # categorical 94 or 95, fine to use.
+df$mig_year <- as.factor(df$mig_year)
+
+hist(df$importance_of_record, xlab = "Importance of Record", main = "Importance of Record Frequency") # examine for outliers
+summary(df$importance_of_record)
+#table(df$importance_of_record) # don't use or split into bins.
+df$importance_grp <- as.factor(ifelse(df$importance_of_record <1000, "<1000", ifelse(df$importance_of_record <2000, "1000-1999",
+      ifelse(df$importance_of_record <3000, "2000-2999", "3000+"))))
+table(df$importance_grp) # use this grouped variable.
+
+## Summary of outliers:
+
+# Use age_grp instead of age, use wage_grps instead of wage_per_hour, 
+# use importance_grp instead of importance_of_record.
+
+# Turned Employment Stat into factor. Turned industry code into a factor. Turned occupation code into a factor. Can we group codes further?
+# Turned Mig Year into factor.
+
+# Recommend dropping gains and losses. Possible stocks_status, or use stock_status_grp.
+```
+
+# Drop columns from above analysis
+```{r}
+
+# Drop from df: 'age', 'wage_per_hour', 'importance_of_record', 'stocks_status', 'working_week_per_year' 
+# 'education', 'class', 'marital_status', 'is_hispanic', 'employment_commitment', 'tax_status', 
+# 'citizenship'
+df = subset(df, select = -c(age, wage_per_hour, importance_of_record, stocks_status, working_week_per_year,
+                            education, class, marital_status, is_hispanic, employment_commitment,
+                            tax_status, citizenship))
+
+# Instead use: 'age_grp', 'wage_grp', 'importance_grp', 'stock_status_grp', 'working_weeks_grp'
+# 'education_grp, 'govt_employee', 'is_married', 'is_hispanic_grp', 'work_hours', 'tax_status_grp',
+# 'citizenship_grp'
+
+# drop 'gains' and 'losses' per above recommendation (large amount of 0's)
+df = subset(df, select = -c(gains, losses))
+
+str(df)
+```
+
+## Split into training and testing data
+```{r}
+sample <- sample(c(TRUE, FALSE), nrow(df), replace=TRUE, prob=c(0.7,0.3))
+train  <- df[sample, ]
+test   <- df[!sample, ]
+```
+## Create lasso and run cv glmnet
+```{r}
+#LASSO - separate into feature and target set
+y <- train$is_labor_union
+X <- data.matrix(train[, !names(train) %in% c("is_labor_union")])
+X[is.na(X)] <- 2
+
+#Create cv sets at 10 folds, models, and coefficients and select for 20 variables 
+lasso_cv <- cv.glmnet(X, y, alpha=1, nfolds=10, family="binomial", type.measure = "mse", dfmax=20)
+lasso_model <- glmnet(X, y, alpha=1, nlambda=100, family = "binomial", dfmax=20)
+lasso_coef <- coef(lasso_model, s=lasso_cv$lambda.min, family="binomial")
+```
+
+## Lasso model glmnet improvement
+```{r, echo=FALSE}
+#Plot model and its minimum lambda found
+plot(lasso_cv)
+```
+
+## Best glmnet model lambda
+```{r}
+plot(lasso_model, xvar="lambda", lwd=2)
+abline(v=log(lasso_cv$lambda.min), col='black', lty=2, lwd=2)
+
+
+#Model Coefficients
+lasso_coef
+coefs = as.data.frame(as.matrix(lasso_coef))
+zeros <- coefs %>%
+  filter(s1 == 0)
+coefs <- coefs %>% 
+  filter(s1 != 0)
+```
+
+## Final feature selection
+### Not selected
+```{r}
+#Features not selected with threshold 20
+zeros
+```
+### Selected
+```{r}
+#Features selected with threshold 20
+coefs
+```
+
+## Drop the variables forced to zero by lasso
+```{r}
+df <- df[,!(names(df) %in% c("household_stat","household_summary","vet_benefit",
+                             "country_of_birth_own", "country_of_birth_father", 
+                             "is_hispanic_grp", "work_hours"))]
+colnames(df)
+```
+
+## Top 10 variables by IV
+```{r, echo=FALSE}
+# Weight of Evidence -------------------------------------
+woe_df <- df
+
+# Response to numeric
+woe_df$is_labor_union <- ifelse(woe_df$is_labor_union == 'Same', 1, 0)
+
+# Create Info Tables
+IV <- create_infotables(data=woe_df, y="is_labor_union")
+print(IV$Summary$Variable[1:10])
+
+# Plot WOE charts
+names <- IV[["Summary"]][["Variable"]]
+plots <- list()
+for (i in 1:length(names)){
+  plots[[i]] <- plot_infotables(IV, names[i])
+}
+
+# Showing the top 10 variables
+plots[1:10]
+```
+
+## Test Model and Model Performance
+```{r}
+firstmodel <- glm(is_labor_union ~ industry_code + occupation_code + govt_employee + wage_grps + total_employed + age_grp + tax_status_grp + working_weeks_grp, data=train, family="binomial")
+predictions <- predict(firstmodel, test, type="response")
+predictions <- as.factor(predictions > 0.5)
+actual <- test$is_labor_union
+actual <- as.factor(actual == "Same")
+confusionMatrix(table(actual,predictions))
+```
+## Synthetic Minority Oversampling (SMOTE)
+```{r}
+set.seed(1234)
+
+balancedf <- smote(is_labor_union ~ ., data=df)
+sample2 <- sample(c(TRUE, FALSE), nrow(df), replace=TRUE, prob=c(0.9,0.1))
+balancetrain  <- balancedf[sample, ]
+balancetest   <- balancedf[!sample, ]
+```
+```{r}
+bestmodel <- glm(is_labor_union ~ industry_code + occupation_code + govt_employee + wage_grps + total_employed + age_grp + tax_status_grp + working_weeks_grp, data=balancetrain, family="binomial")
+predictions <- predict(bestmodel, balancetest, type="response")
+predictions <- as.factor(predictions > 0.4)
+probabilities <- predict(bestmodel, balancetest, type="response")
+actual <- balancetest$is_labor_union
+actual <- as.factor(actual == "Same")
+cm <- confusionMatrix(table(actual,predictions))
+cm
+```
+## Plot Confusion Matrix
+```{r}
+ggplot(data.frame(cm$table),aes(actual,predictions)) +
+  scale_color_gradient(low = "white", high = "black") +
+  geom_tile(aes(fill= Freq)) +
+  scale_fill_gradient(low = "white", high = "red") +
+  geom_text(aes(label = sprintf("%d", Freq), vjust = 1)) 
+```
+
+# ROC and AUC
+```{r}
+roc_obj <- roc(as.numeric(actual), as.numeric(probabilities))
+plot(roc_obj, main="Receiver Operating Characteristic (ROC) Curve", colorize=FALSE)
+
+# Calculate and print the AUC score
+auc_score <- auc(roc_obj)
+print(paste("AUC Score:", auc_score))
+```
